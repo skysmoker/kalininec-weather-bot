@@ -1,7 +1,9 @@
 import os
+import sys
 import time
 import logging
 import datetime
+from collections import Counter
 from pathlib import Path
 import requests
 from dotenv import load_dotenv
@@ -25,6 +27,37 @@ MONTHS_RU = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря"
 ]
+
+WMO_DESCRIPTIONS = {
+    0: "ясно",
+    1: "преимущественно ясно",
+    2: "переменная облачность",
+    3: "пасмурно",
+    45: "туман",
+    48: "изморозь и туман",
+    51: "слабая морось",
+    53: "умеренная морось",
+    55: "сильная морось",
+    56: "слабая ледяная морось",
+    57: "ледяная морось",
+    61: "небольшой дождь",
+    63: "умеренный дождь",
+    65: "сильный дождь",
+    66: "слабый ледяной дождь",
+    67: "ледяной дождь",
+    71: "небольшой снег",
+    73: "умеренный снег",
+    75: "сильный снег",
+    77: "снежные зёрна",
+    80: "кратковременный дождь",
+    81: "ливневый дождь",
+    82: "сильный ливень",
+    85: "небольшой снегопад",
+    86: "сильный снегопад",
+    95: "гроза",
+    96: "гроза с небольшим градом",
+    99: "гроза с градом",
+}
 
 LOG_FILE = BASE_DIR / "weather.log"
 STATE_FILE = BASE_DIR / "last_sent.txt"
@@ -74,15 +107,15 @@ def get_weather_data() -> dict:
     raise last_error
 
 
-def parse_hourly_data(data: dict) -> list[dict]:
+def parse_hourly_data(data: dict, day_offset: int = 0) -> list[dict]:
     times = [datetime.datetime.fromisoformat(t) for t in data["hourly"]["time"]]
     hourly = data["hourly"]
-    today_date = times[0].date()
-    today_hours = []
+    target_date = times[0].date() + datetime.timedelta(days=day_offset)
+    day_hours = []
 
     for i, t in enumerate(times):
-        if t.date() == today_date:
-            today_hours.append({
+        if t.date() == target_date:
+            day_hours.append({
                 "hour": t.hour,
                 "temp": hourly["temperature_2m"][i],
                 "feels_like": hourly["apparent_temperature"][i],
@@ -95,7 +128,7 @@ def parse_hourly_data(data: dict) -> list[dict]:
                 "weathercode": hourly["weathercode"][i],
                 "uv": hourly["uv_index"][i] or 0,
             })
-    return today_hours
+    return day_hours
 
 
 def average(values: list) -> float:
@@ -126,7 +159,7 @@ def weather_emoji(code) -> str:
     if code in (51, 53, 55, 56, 57):
         return "🌦️"
     if code in (61, 63, 65, 66, 67):
-        return "🌨️"
+        return "🌧️"
     if code in (71, 73, 75, 77):
         return "🌨️"
     if code in (80, 81, 82):
@@ -138,7 +171,53 @@ def weather_emoji(code) -> str:
     return "🌡️"
 
 
-def format_message(today_hours: list[dict]) -> str:
+def weather_description(code) -> str:
+    if code is None:
+        return "без существенных явлений"
+    return WMO_DESCRIPTIONS.get(code, "переменная погода")
+
+
+def get_dominant_weather_code(hours: list[dict]):
+    """Выбирает наиболее характерный код погоды за световой день (приоритет у осадков и гроз)."""
+    if not hours:
+        return None
+    codes = [h["weathercode"] for h in hours if h["weathercode"] is not None]
+    if not codes:
+        return None
+    # Если были осадки/грозы/туман (код >= 45), берём самый значимый из них
+    significant = [c for c in codes if c >= 45]
+    if significant:
+        return Counter(significant).most_common(1)[0][0]
+    return Counter(codes).most_common(1)[0][0]
+
+
+def get_smart_warnings(today_hours: list[dict], precip_sum: float, wind_speed_max: float) -> list[str]:
+    """Формирует список предупреждений только при реальных погодных аномалиях."""
+    warnings = []
+    temps = [h["temp"] for h in today_hours if h["temp"] is not None]
+    pressures_mmhg = [h["pressure"] * 0.75006 for h in today_hours if h["pressure"] is not None]
+    codes = {h["weathercode"] for h in today_hours if h["weathercode"] is not None}
+
+    if codes & {95, 96, 99}:
+        warnings.append("⚠️ В течение дня возможна гроза.")
+    if codes & {56, 57, 66, 67}:
+        warnings.append("⚠️ Ожидается ледяной дождь — будьте осторожны на дорогах.")
+
+    if temps and min(temps) <= 0 and max(temps) >= 0.5 and (precip_sum > 0.2 or codes & {51, 53, 55, 61, 63, 65, 71, 73, 75, 80, 81, 82, 85, 86}):
+        warnings.append("⚠️ Переход температуры через 0°C — возможна гололедица.")
+
+    if pressures_mmhg:
+        diff = round(max(pressures_mmhg) - min(pressures_mmhg))
+        if diff >= 8:
+            warnings.append(f"⚠️ Резкий перепад давления за сутки (на {diff} мм рт. ст.).")
+
+    if wind_speed_max >= 12.0:
+        warnings.append(f"⚠️ Сильный порывистый ветер до {wind_speed_max:.1f} м/с.")
+
+    return warnings
+
+
+def format_message(today_hours: list[dict], target_date: datetime.date | None = None, is_morning: bool = True) -> str:
     day_hours = [h for h in today_hours if DAY_START_HOUR <= h["hour"] < DAY_END_HOUR]
     night_hours = [h for h in today_hours if h["hour"] >= DAY_END_HOUR or h["hour"] < DAY_START_HOUR]
 
@@ -158,15 +237,21 @@ def format_message(today_hours: list[dict]) -> str:
     wind_dir_avg = average(wind_dirs)
     wind_compass = deg_to_compass(wind_dir_avg) if wind_dirs else "—"
 
-    noon = next((h for h in today_hours if h["hour"] == 12), today_hours[0])
-    emoji = weather_emoji(noon["weathercode"])
+    dominant_code = get_dominant_weather_code(day_hours or today_hours)
+    emoji = weather_emoji(dominant_code)
+    desc = weather_description(dominant_code)
 
-    today = datetime.date.today()
-    date_str = f"{today.day} {MONTHS_RU[today.month - 1]}"
+    date_obj = target_date or datetime.date.today()
+    date_str = f"{date_obj.day} {MONTHS_RU[date_obj.month - 1]}"
 
-    lines = [
-        f"{emoji} <b>Доброе утро!</b>",
-        f"Погода в Калининце на {date_str}:",
+    lines = []
+    if is_morning:
+        lines.append(f"{emoji} <b>Доброе утро!</b>")
+        lines.append(f"Погода в Калининце на {date_str} — <i>{desc}</i>:")
+    else:
+        lines.append(f"{emoji} <b>Погода в Калининце на {date_str}</b> — <i>{desc}</i>:")
+
+    lines.extend([
         "",
         "🌡️ <b>Температура:</b>",
         f"   • Днём {temp_day:+.0f}°C / Ночью {temp_night:+.0f}°C",
@@ -183,28 +268,42 @@ def format_message(today_hours: list[dict]) -> str:
         "",
         "📊 <b>Давление:</b>",
         f"   • {pressure_mmhg} мм рт. ст.",
-    ]
+    ])
+
+    warnings = get_smart_warnings(today_hours, precip_sum, wind_speed_max)
+    if warnings:
+        lines.append("")
+        lines.extend(warnings)
+
     return "\n".join(lines)
 
 
-def send_telegram_message(text: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
+def send_telegram_message(text: str, target_chat_id: str | int | None = None) -> None:
+    chat = target_chat_id or CHAT_ID
+    if not BOT_TOKEN or not chat:
         raise ValueError("Не заданы BOT_TOKEN или CHAT_ID в файле .env")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    data = {"chat_id": chat, "text": text, "parse_mode": "HTML"}
     response = requests.post(url, data=data, timeout=15)
     response.raise_for_status()
 
 
 def main() -> None:
-    if already_sent_today():
+    test_mode = "--test" in sys.argv
+
+    if not test_mode and already_sent_today():
         logging.info("Прогноз за сегодня уже был успешно отправлен. Повторный запуск отменён.")
         return
 
     try:
         data = get_weather_data()
-        today_hours = parse_hourly_data(data)
-        message = format_message(today_hours)
+        today_hours = parse_hourly_data(data, day_offset=0)
+        message = format_message(today_hours, is_morning=True)
+
+        if test_mode:
+            print(message)
+            return
+
         send_telegram_message(message)
         mark_sent_today()
         logging.info("Успешно отправлено в Telegram.")
