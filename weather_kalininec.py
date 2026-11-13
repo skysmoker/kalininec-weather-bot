@@ -83,7 +83,7 @@ def mark_sent_today() -> None:
     STATE_FILE.write_text(today_str + "\n", encoding="utf-8")
 
 
-def get_weather_data() -> dict:
+def get_weather_data(forecast_days: int = 2) -> dict:
     url = (
         f"https://api.open-meteo.com/v1/forecast"
         f"?latitude={LATITUDE}&longitude={LONGITUDE}"
@@ -91,7 +91,7 @@ def get_weather_data() -> dict:
         f"precipitation_probability,pressure_msl,wind_speed_10m,"
         f"wind_direction_10m,weathercode,uv_index"
         f"&daily=sunrise,sunset"
-        f"&timezone={TIMEZONE}&forecast_days=2&wind_speed_unit=ms"
+        f"&timezone={TIMEZONE}&forecast_days={forecast_days}&wind_speed_unit=ms"
     )
     last_error = None
     for attempt in range(1, 4):
