@@ -1,0 +1,6 @@
+.env
+venv/
+weather.log
+last_sent.txt
+__pycache__/
+*.pyc
